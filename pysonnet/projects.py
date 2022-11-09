@@ -213,6 +213,7 @@ class Project(dict):
                 :keyword f2: upper frequency (float)
                 :keyword n_points: number of points in the sweep, optional (integer)
                 :keyword f_step: frequency step in the sweep, optional (float)
+                :keyward adaptive: use adaptive band synthesis (bool)
             'exponential': compute on an exponential range between f1 and f2
                 :keyword f1: lower frequency (float)
                 :keyword f2: upper frequency (float)
@@ -243,6 +244,7 @@ class Project(dict):
         f2 = kwargs.pop('f2', None)
         n_points = kwargs.pop('n_points', None)
         f_step = kwargs.pop('f_step', None)
+        adaptive = kwargs.pop('adaptive', False)
         frequency_list = kwargs.pop('frequency_list', None)
         s_parameter = kwargs.pop('s_parameter', None)
         # define some messages to be used throughout the function
@@ -281,6 +283,8 @@ class Project(dict):
                 message = ("one of 'f_step' or 'n_points' must be specified for a linear "
                            "sweep")
                 raise ValueError(message)
+            if adaptive:
+                sweep = "AY {:s}".format(sweep)
         elif sweep_type == 'exponential':
             assert f1 is not None and f2 is not None, f1_f2_message
             assert n_points is not None, n_points_message
