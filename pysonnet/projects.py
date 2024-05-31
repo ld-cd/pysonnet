@@ -981,7 +981,7 @@ class GeometryProject(Project):
         level = polygon[index]
         level = level.split()
         if level[4] not in file_ids:
-            file_id = str(n_ports + 10 * len(polygons))
+            file_id = str(n_ports + 10 * len(polygons) + 1000)
             level[4] = file_id
             level = " ".join(level)
             polygon[index] = level
