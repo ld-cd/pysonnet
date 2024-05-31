@@ -4,6 +4,7 @@ import shlex
 import shutil
 import psutil
 import logging
+import pathlib
 import subprocess
 import numpy as np
 from datetime import datetime
@@ -14,7 +15,7 @@ from pysonnet.sonnet import test_sonnet
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 
-__version__ = '0.0.3'
+__version__ = '0.0.4'
 
 
 class Project(dict):
@@ -39,6 +40,8 @@ class Project(dict):
             if not os.path.isfile(load_path):
                 load_path = os.path.join(directory, 'default_configuration.yaml')
             self.load(load_path)
+        self.object_ids = []
+        self.port_numbers = []
 
     def make_sonnet_file(self, file_path):
         """
@@ -91,7 +94,7 @@ class Project(dict):
 
     def set_options(self, current_density=False, frequency_cache=False,
                     memory_save=False, box_resonance=False, deembed=True,
-                    q_accuracy=False, resonance_detection=False, custom=""):
+                    q_accuracy=False, resonance_detection=False, memory=None, custom=""):
         """
         Set the Sonnet options. Old options are overridden.
 
@@ -102,6 +105,8 @@ class Project(dict):
         :param deembed: deembeds the project ports (boolean)
         :param q_accuracy: accurate line widths for resonators (boolean)
         :param resonance_detection: better resonance detection (boolean)
+        :param memory: use either "high", "medium", or "low" to set the amount
+            of memory used for the mesh. (string)
         :param custom: custom options for sonnet (string)
         """
         # add the main options to a string
@@ -121,6 +126,7 @@ class Project(dict):
         # add other options
         self['control']['q_accuracy'] = "Y" if q_accuracy else "N"
         self['control']['res_detection'] = "Y" if resonance_detection else "N"
+        self['control']['speed'] = b.SPEED_TYPES[memory]
         log.debug("q factor accuracy {}".format("on" if q_accuracy else "off"))
 
     def run(self, analysis_type=None, file_path=None, options='-v',
@@ -162,7 +168,7 @@ class Project(dict):
             raise ValueError(message)
         # check to make sure that sonnet has been configured
         if self['sonnet']["sonnet_path"] == '':
-            raise ValueError("configure sonnet before running")
+            raise ValueError("configure or locate sonnet before running")
         # collect the command to run
         command = [os.path.join(self['sonnet']["sonnet_path"], "bin", "em")]
         if options:
@@ -175,22 +181,31 @@ class Project(dict):
         with psutil.Popen(command, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE) as process:
             while True:
-                output = process.stdout.readline().decode('utf-8').strip()
-                error = process.stderr.readline().decode('utf-8').strip()
-                if not output and not error and process.poll() is not None:
+                output = process.stdout.readline()
+                if not output and process.poll() is not None:
                     break
-                if output:
-                    log.info(output)
-                if error:
-                    log.error(error)
+                message = output.decode('utf-8').strip()
+                if message:
+                    log.info(message)
+            while True:
+                error = process.stderr.readline()
+                if not error and process.poll() is not None:
+                    break
+                message = error.decode('utf-8').strip()
+                if message:
+                    log.error(message)
 
-
-    def locate_sonnet(self, sonnet_path):
+    def locate_sonnet(self, sonnet_path=None):
         """
         Provide the project with the path to the Sonnet folder so that it can be run.
 
         :param sonnet_path: path to the Sonnet program
         """
+        if sonnet_path is None:
+            sonnet_path = pathlib.Path(shutil.which("sonnet")).parent.parent
+            log.debug(f"Found sonnet path at {sonnet_path}")
+        if not sonnet_path:
+            raise ValueError("The sonnet path could not be found. Specify it directly or add it to the PATH.")
         version, license_id = test_sonnet(sonnet_path)
         self['sonnet']['sonnet_path'] = sonnet_path
         log.debug("sonnet path set to '{}'".format(sonnet_path))
@@ -294,9 +309,7 @@ class Project(dict):
             sweep = b.STEP_FORMAT.format(f1=f1)
         elif sweep_type == 'list':
             assert frequency_list is not None, frequency_list_message
-            sweep = b.LIST_FORMAT
-            for frequency in frequency_list:
-                sweep.append(str(frequency) + ' ')
+            sweep = b.LIST_FORMAT.format(frequency_list="".join([str(f) + " " for f in frequency_list]))
         elif sweep_type == 'dc':
             if f1 is None:
                 sweep = b.DC_FORMAT.format(fcalc="AUTO", frequency='')
@@ -476,7 +489,7 @@ class GeometryProject(Project):
         assert name != 'lossless', message
         # determine the pattern id and set the location string
         metals = self['geometry']['metals'].splitlines()
-        pattern_id = len(metals) - 2
+        pattern_id = len(metals) - 1
         location = "MET"
         # format the new metal
         if metal_type == 'normal':
@@ -705,9 +718,20 @@ class GeometryProject(Project):
             self['geometry']['symmetry'] = 'SYM'
             log.debug("symmetry enabled")
 
-    def define_dielectric_bricks(self):
-        """Defines a dielectric brick that can be used in the project."""
-        raise NotImplementedError
+    def define_dielectric_brick(self, name, epsilon=1, loss_tangent=0, conductivity=0):
+        """
+        Defines a dielectric brick that can be used in the project.
+
+        :param name: unique name of the brick.
+        :param epsilon: the relative dielectric constant
+        :param loss_tangent: the loss tangent of the material
+        :param conductivity: the conductivity of the material
+        """
+        dielectrics = self['geometry']['dielectrics'].splitlines()
+        pattern_id = len(dielectrics) + 1  # first pattern is air which always exists
+        self['geometry']['dielectrics'] += b.ISOTROPIC_DIELECTRIC_BRICK_FORMAT.format(
+            name=name, pattern_id=pattern_id, epsilon=epsilon, loss_tangent=loss_tangent, conductivity=conductivity
+        ) + os.linesep
 
     def define_technology_layer(self, layer_type, name, level, material,
                                 fill_type='staircase', edge_mesh=True, **kwargs):
@@ -780,7 +804,16 @@ class GeometryProject(Project):
                     assert material_value in b.VIA_TYPES.values(), \
                         message.format('via', list(b.VIA_TYPES.keys()))
         else:
-            raise NotImplementedError
+            if material == 'air':
+                material_index = 0
+            else:
+                defined_dielectrics = self['geometry']['dielectrics'].splitlines()
+                defined_names = []
+                for defined_dielectric in defined_dielectrics:
+                    defined_names.append(shlex.split(defined_dielectric)[1])
+                # plus 1 because air is included as a default even if it's not defined
+                material_index = np.where(material == np.array(defined_names))[0][0] + 1
+
         # set the level format
         level_format = {"level": level, "n_vertices": 0, "material": material_index,
                         "fill_type": b.FILL_TYPES[fill_type],
@@ -842,7 +875,7 @@ class GeometryProject(Project):
                   .format(dx, dy, " not" if not locked else ""))
 
     def add_port(self, port_type, number, x, y, resistance=0,
-                 reactance=0, inductance=0, capacitance=0, **kwargs):
+                 reactance=0, inductance=0, capacitance=0, level=None, **kwargs):
         """
         Adds a port to the project.
 
@@ -863,17 +896,18 @@ class GeometryProject(Project):
                 :keyword fixed_reference_plane: is the reference plane fixed (boolean)
                 :keyword length: calibration length (float)
             'co-calibrated': a port that is part of a calibration group (string)
-                :keyword independent: the port is independent, default False (boolean)
                 :keyword fixed_reference_plane: is the reference plane fixed (boolean)
-                :keyword length: calibration length (float)
-                :keyword group_id: co-calibration group id, automatic by default (string)
+                :keyword group_id: co-calibration group id, automatic by default.
+                    See add_calibration_group() (string)
         :param number: port number (non-zero integer)
         :param x: x position of the port (float)
         :param y: y position of the port (float)
-        :param resistance: resistance of the port in ohms (float)
-        :param reactance: reactance of the port in ohms (float)
-        :param inductance: inductance of the port in nH (float)
-        :param capacitance: capacitance of the port in pF (float)
+        :param resistance: resistance of the port in Ohms (float)
+        :param reactance: reactance of the port in Ohms (float)
+        :param inductance: inductance of the port in Henries (float)
+        :param capacitance: capacitance of the port in Farads (float)
+        :param level: level of the layer to add the port to. The layer can be an integer or a
+            tech layer name. If None, all layers are searched for the correct polygon (integer, str)
         """
         # check inputs
         message = "'port_type' parameter must be one of {}"
@@ -892,6 +926,8 @@ class GeometryProject(Project):
             assert independent, message
         else:  # co-calibrated
             independent = kwargs.pop("independent", False)
+            message = "co-calibrated ports are always never independent"
+            assert not independent, message
         # count the number of ports already made
         ports = ['POR1' + c for c in self['geometry']['ports'].split('POR1') if c]
         n_ports = len(ports)
@@ -908,24 +944,35 @@ class GeometryProject(Project):
         position = np.array([x, y])
         new_position = position
         for index, polygon in enumerate(polygons):
-            generator = (r for r in polygon.splitlines() if r and not r[0] in ('T', 'E'))
+            # Check polygon if in right level
+            if isinstance(level, int):
+                if int(polygon.splitlines()[1].split(" ")[0]) != level:
+                    continue
+            elif isinstance(level, str):
+                identifier = b.TECHLAYER_NAME_FORMAT.split(" ")[0]
+                line = None
+                for polygon_line in polygon.splitlines():
+                    if identifier in polygon_line:
+                        line = polygon_line
+                if line is None or line.split(" ")[1].strip('"') != level:
+                    continue
+            else:
+                if level is not None:
+                    raise ValueError("'level' keyword argument must be an integer or string.")
+
+            # Filter out Techlayer, End, Brick and Via lines
+            generator = (r for r in polygon.splitlines() if r and not r[0] in ('T', 'E', 'B', 'V'))
             polygon = np.genfromtxt(generator, skip_header=1)
-            distance = np.linalg.norm(polygon - position, axis=1)
+            mid_points = (polygon[1:] + polygon[:-1]) / 2
+            distance = np.linalg.norm(mid_points - position, axis=1)
             trial_index = np.argmin(np.abs(distance))
             trial_value = np.abs(distance[trial_index])
             if trial_value < min_value:
                 min_value = trial_value
                 min_index = trial_index
                 polygon_index = index
-                # [:-1, :] removes the repeated point at the end of the file
-                lower = polygon[:-1, :][min_index - 1, :]
-                # % (polygon.shape[0] - 1) skips the repeated point at the end
-                upper = polygon[(min_index + 1) % (polygon.shape[0] - 1), :]
-                if np.linalg.norm(lower - position) < np.linalg.norm(upper - position):
-                    new_position = (lower + polygon[min_index, :]) / 2
-                    min_index = (min_index - 1) % (polygon.shape[0] - 1)
-                else:
-                    new_position = (upper + polygon[min_index, :]) / 2
+                new_position = mid_points[min_index, :]
+
         # set the debug_id equal to the port id
         polygon = polygons[polygon_index].splitlines()
         condition = (not polygon[0] or polygon[0][:3] == 'MET' or
@@ -934,7 +981,7 @@ class GeometryProject(Project):
         level = polygon[index]
         level = level.split()
         if level[4] not in file_ids:
-            file_id = str(n_ports + 1001)
+            file_id = str(n_ports + 10 * len(polygons))
             level[4] = file_id
             level = " ".join(level)
             polygon[index] = level
@@ -949,7 +996,7 @@ class GeometryProject(Project):
         diagonal_string = b.DIAGONAL_FORMAT.format(allowed="Y" if diagonal else "N")
         if independent:
             fixed_reference_plane = kwargs.pop("fixed_reference_plane", False)
-            reference_type = "NONE" if fixed_reference_plane else "FIX"
+            reference_type = "NONE" if not fixed_reference_plane else "FIX"
             length = kwargs.pop("length", None)
             length_string = 0 if length is None else length
         else:
@@ -965,17 +1012,101 @@ class GeometryProject(Project):
                        "file_id": file_id, "polygon_index": min_index,
                        "x": new_position[0], "y": new_position[1]}
         self['geometry']['ports'] += b.PORT_FORMAT.format(**port_format)
+        self.port_numbers.append(number)
         log.debug("{} port {} added at ({}, {}) with parameters ({}, {}, {}, {})"
                   .format(port_type, number, new_position[0], new_position[1], resistance,
                           reactance, inductance, capacitance))
 
-    def add_calibration_group(self):
-        """Adds a calibration group to the project."""
-        raise NotImplementedError
+    def add_calibration_group(self, group_id, ground='box cover', terminal_width='feedline'):
+        """Adds a calibration group to the project.
+        :param group_id: Calibration group identifying string
+        :param terminal_width: electrical contact width of the terminal
+                    ('feedline', 'cell', or the width number)
+        :param ground: how the port is connected to ground
+            ('floating', 'box cover', or 'polygon plane')
 
-    def add_component(self):
-        """Adds a component to the project."""
-        raise NotImplementedError
+        """
+        object_id = max(self.object_ids) + 1 if self.object_ids else 0
+        self.object_ids.append(object_id)
+        ground_string = b.GROUND_REFERENCE_TYPES[ground]
+        if isinstance(terminal_width, str):
+            terminal_width_string = b.TERMINAL_WIDTH_TYPES[terminal_width]
+        else:
+            terminal_width_string = b.TERMINAL_WIDTH_VALUE.format(value=terminal_width)
+
+        self['geometry']['calibration_group'] += b.CALIBRATION_GROUP_FORMAT.format(
+            group_id=group_id,
+            object_id=object_id,
+            ground=ground_string,
+            terminal_width=terminal_width_string
+        )
+
+    def add_component(self, component, value, xy1, xy2, level, label, ground='floating',
+                      terminal_width='feedline'):
+        """Adds a component to the project.
+        :param component: Component type. Either 'capacitor', 'inductor', or 'resistor'.
+        :param value: Component value as a float. Use the standard units for the project.
+        :param xy1: xy position of the first terminal.
+        :param xy2: xy position of the second terminal.
+        :param level: The component metal level.
+        :param label: The component label.
+        :param ground: how the terminals are connected to ground
+            ('floating', 'box cover', or 'polygon plane')
+        :param terminal_width: electrical contact width of the terminal
+            ('feedline', 'cell', or the width number)
+        """
+        object_id = max(self.object_ids) + 1 if self.object_ids else 0
+        self.object_ids.append(object_id)
+        ground_string = b.GROUND_REFERENCE_TYPES[ground]
+        if isinstance(terminal_width, str):
+            terminal_width_string = b.TERMINAL_WIDTH_TYPES[terminal_width]
+        else:
+            terminal_width_string = b.TERMINAL_WIDTH_VALUE.format(value=terminal_width)
+
+        center = (np.array(xy1) + np.array(xy2)) / 2
+        dx = np.abs(xy2[0] - xy1[0])
+        dy = np.abs(xy2[1] - xy1[1])
+        if dx == 0:
+            direction1 = "top" if xy1[1] > xy2[1] else "bottom"
+            direction2 = "bottom" if xy1[1] > xy2[1] else "top"
+            symbol_box = (center[0] - dy / 10, center[0] + dy / 10, center[1] + dy / 3, center[1] - dy / 3)
+        elif dy == 0:
+            direction1 = "left" if xy1[0] < xy2[0] else "right"
+            direction2 = "right" if xy1[0] < xy2[0] else "left"
+            symbol_box = (center[0] - dx / 3, center[0] + dx / 3, center[1] + dx / 10, center[1] - dx / 10)
+        else:
+            direction1 = "diagonal"
+            direction2 = "diagonal"
+            symbol_box = (min(xy1[0], xy2[0]), max(xy1[0], xy2[0]), max(xy1[1], xy2[1]), min(xy1[1], xy2[1]))
+
+        port1_num = max(self.port_numbers) + 1
+        self.port_numbers.append(port1_num)
+        port2_num = max(self.port_numbers) + 1
+        self.port_numbers.append(port2_num)
+
+        self['geometry']['components'] += b.COMPONENT_FORMAT.format(
+            level=level,
+            label=label,
+            object_id=object_id,
+            ground=ground_string,
+            terminal_width=terminal_width_string,
+            symbol_left=symbol_box[0],
+            symbol_right=symbol_box[1],
+            symbol_top=symbol_box[2],
+            symbol_bottom=symbol_box[3],
+            label_x=center[0],
+            label_y=center[1],
+            component_type=b.COMPONENT_TYPES[component],
+            component_value=value,
+            port1_x=xy1[0],
+            port1_y=xy1[1],
+            port1_dir=b.DIRECTION_TYPES[direction1],
+            port1_num=port1_num,
+            port2_x=xy2[0],
+            port2_y=xy2[1],
+            port2_dir=b.DIRECTION_TYPES[direction2],
+            port2_num=port2_num,
+        )
 
     def add_gdstk_cell(self, polygon_type, cell, layer=None, datatype=None,
                        **kwargs):
@@ -1085,29 +1216,41 @@ class GeometryProject(Project):
                         "y_max": kwargs.pop("y_max", 100),
                         "conformal_max": kwargs.pop("conformal_max", 0),
                         "edge_mesh": "Y" if kwargs.pop("edge_mesh", True) else "N"}
-        name = kwargs.pop("material", "lossless")
+        name = kwargs.pop("material", "lossless" if polygon_type == 'metal' or polygon_type == 'via' else 'air')
         condition = (name == 'lossless' and (polygon_type == 'metal' or
                                              polygon_type == 'via') or
                      name == 'air' and polygon_type == 'dielectric brick')
-        if condition:
-            metal_index = -1
-        else:
-            defined_metals = self['geometry']['metals'].splitlines()[2:]
-            defined_names = []
-            for defined_metal in defined_metals:
-                defined_names.append(shlex.split(defined_metal)[1])
-            metal_index = np.where(name == np.array(defined_names))[0][0]
-            # check that we have a valid material
-            material_value = shlex.split(defined_metals[metal_index])[3]
-            message = ("for a '{}' the 'material' parameter must be one of these "
-                       "types from define_metal() {}")
-            if polygon_type == 'metal':
-                assert material_value in b.METAL_TYPES.values(), \
-                    message.format('metal', list(b.METAL_TYPES.keys()))
+        if polygon_type == 'metal' or polygon_type == 'via':
+            if condition:
+                material_index = -1
             else:
-                assert material_value in b.VIA_TYPES.values(), \
-                    message.format('via', list(b.VIA_TYPES.keys()))
-        level_format['material'] = metal_index
+                defined_metals = self['geometry']['metals'].splitlines()[2:]
+                defined_names = []
+                for defined_metal in defined_metals:
+                    defined_names.append(shlex.split(defined_metal)[1])
+                material_index = np.where(name == np.array(defined_names))[0][0]
+                # check that we have a valid material
+                material_value = shlex.split(defined_metals[material_index])[3]
+                message = ("for a '{}' the 'material' parameter must be one of these "
+                           "types from define_metal() {}")
+                if polygon_type == 'metal':
+                    assert material_value in b.METAL_TYPES.values(), \
+                        message.format('metal', list(b.METAL_TYPES.keys()))
+                else:
+                    assert material_value in b.VIA_TYPES.values(), \
+                        message.format('via', list(b.VIA_TYPES.keys()))
+        else:
+            if condition:
+                material_index = 0
+            else:
+                defined_dielectrics = self['geometry']['dielectrics'].splitlines()
+                defined_names = []
+                for defined_dielectric in defined_dielectrics:
+                    defined_names.append(shlex.split(defined_dielectric)[1])
+                # plus 1 because air is included as a default even if it's not defined
+                print(defined_names, defined_dielectrics, name)
+                material_index = np.where(name == np.array(defined_names))[0][0] + 1
+        level_format['material'] = material_index
         # set up the to_level format for the new polygons
         if polygon_type == 'via':
             message = "'{}' keyword argument is required for via polygons"
@@ -1147,11 +1290,16 @@ class GeometryProject(Project):
             self['geometry']['n_polygons'] += 1
             log.debug("polygon added")
 
-    def add_output_file(self, file_type, output_folder=None, deembed=True,
-                        include_abs=True, include_comments=True, high_precision=True,
-                        file_name=None, parameter_type='S', parameter_form='RI'):
+    def add_output_file(self, *args, **kwargs):
+        import warnings
+        warnings.warn("add_output_file() is deprecated. Use add_syz_parameter_file() instead.")
+        self.add_syz_parameter_file(*args, **kwargs)
+
+    def add_syz_parameter_file(self, file_type, output_folder=None, deembed=True,
+                               include_abs=True, include_comments=True, high_precision=True,
+                               file_name=None, parameter_type='S', parameter_form='RI'):
         """
-        Add an output file for the response data from the analysis of the project.
+        Add an output file for the SYZ parameter data from the analysis of the project.
 
         :param file_type: output file type (string)
             Valid options are 'touchstone', 'touchstone2', 'databank', 'scompact',
@@ -1233,6 +1381,40 @@ class GeometryProject(Project):
                                                ports=port_string)
         # add the output file to the project
         self['output_file']['response_data'] += output + os.linesep
+        log.debug("{} output file added here '{}'".format(file_type, output_folder))
+
+    def add_n_coupled_lines_file(self, file_type, output_folder=None, deembed=True,
+                                include_abs=True, high_precision=True, file_name=None):
+        """
+        Add an output file for the SYZ parameter data from the analysis of the project.
+
+        :param file_type: output file type (string)
+            Valid options are 'spectre', 'spice'.
+        :param output_folder: relative path to where the data is saved (string)
+            If no folder is chosen, data will be saved in the top level of the project
+            directory. This option can only be set once per Project, and it's value is
+            overwritten if selected again.
+        :param deembed: save the deembeded data, defaults to True (boolean)
+        :param include_abs: include the abs calculated data, defaults to True (boolean)
+        :param high_precision: use high precision numbers, defaults to True (boolean)
+        :param file_name: output data file name, defaults to the sonnet file name (string)
+        """
+        message = "'file_type' parameter must be in {}".format(list(b.N_COUPLED_LINE_TYPES.keys()))
+        assert file_type.lower() in b.N_COUPLED_LINE_TYPES.keys(), message
+        # parse options
+        deembed = 'D' if deembed else 'ND'
+        include_abs = 'Y' if include_abs else 'N'
+        precision = 15 if high_precision else 8
+        if file_name is None:
+            file_name = '$BASENAME.dat'
+
+        output = b.N_COUPLED_LINE_FORMAT.format(file_type=b.N_COUPLED_LINE_TYPES[file_type.lower()],
+                                                deembed=deembed,
+                                                include_abs=include_abs,
+                                                file_name=file_name,
+                                                precision=precision)
+        # add the output file to the project
+        self['output_file']['n_coupled_line_spice'] += output + os.linesep
         log.debug("{} output file added here '{}'".format(file_type, output_folder))
 
 

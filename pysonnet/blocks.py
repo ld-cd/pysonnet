@@ -114,6 +114,7 @@ WG_LOAD_FORMAT = '{location} "WG Load" 0 WGLOAD'
 FREESPACE_FORMAT = '{location} "Free Space" 0 FREESPACE 376.7303136 0 0 0'
 LOSSLESS_FORMAT = '{location} "Lossless" 0 SUP 0 0 0 0'
 GENERAL_METAL_FORMAT = '{location} "{name}" {pattern_id} SUP {r_dc} {r_rf} {x_dc} {ls}'
+ISOTROPIC_DIELECTRIC_BRICK_FORMAT = 'BRI "{name}" {pattern_id} {epsilon} {loss_tangent} {conductivity}'
 LAYER_FORMAT = ('{thickness} {xy_epsilon} {xy_mu} {xy_e_loss} {xy_m_loss} {xy_sigma} '
                 '{z_partitions} "{name}" {anisotropic} {z_epsilon} {z_mu} '
                 '{z_e_loss} {z_m_loss} {z_sigma}')
@@ -127,6 +128,16 @@ POLY {file_id} 1
 """
 PORT_TYPES = {"standard": "STD", "auto-grounded": "AGND", "co-calibrated": "CUP"}
 DIAGONAL_FORMAT = "DIAGALLOWED {allowed}"
+CALIBRATION_GROUP_FORMAT = """\
+CUPGRP {group_id}
+ID {object_id}
+GNDREF {ground}
+TWTYPE {terminal_width}
+END
+"""
+TERMINAL_WIDTH_TYPES = {"feedline": "FEED", "cell": "1CELL"}
+GROUND_REFERENCE_TYPES = {"floating": "F", "polygon plane": "P", "box cover": "B"}
+TERMINAL_WIDTH_VALUE = "CUST \nTWVALUE {value}"
 TECHLAYER_FORMAT = """\
 TECHLAY {layer_type} "{name}"  <UNSPECIFIED> -1 0
 {poly_type}
@@ -135,6 +146,21 @@ TECHLAY {layer_type} "{name}"  <UNSPECIFIED> -1 0
 END
 END
 """
+COMPONENT_FORMAT = """\
+SMD {level} "{label}"
+ID {object_id}
+GNDREF {ground}
+TWTYPE {terminal_width}
+SBOX {symbol_left} {symbol_right} {symbol_top} {symbol_bottom}
+PBSHW N
+LPOS {label_x} {label_y}
+TYPE IDEAL {component_type} {component_value}
+SMDP {level} {port1_x} {port1_y} {port1_dir} {port1_num} 1
+SMDP {level} {port2_x} {port2_y} {port2_dir} {port2_num} 2
+END
+"""
+COMPONENT_TYPES = {"capacitor": "CAP", "inductor": "IND", "resistor": "RES"}
+DIRECTION_TYPES = {"left": "L", "top": "T", "bottom": "B", "right": "R", "diagonal": "D"}
 POLYGON_FORMAT = """\
 {polygon_type}
 {level}
@@ -189,6 +215,7 @@ ANALYSIS_TYPES = {"frequency sweep": "STD", "parameter sweep": "VARSWP",
                   "optimization": "OPTIMIZE"}
 OPTION_TYPES = {"current_density": "j", "frequency_cache": "A", "memory_save": "m",
                 "box_resonance": "b", "deembed": "d"}
+SPEED_TYPES = {"high": 0, "medium": 1, "low": 2}
 # optimization block
 OPTIMIZATION = """\
 OPT
@@ -224,6 +251,9 @@ RESPONSE_DATA_FORMAT = ("{file_type} {deembed} {include_abs} {file_name} "
 RESPONSE_DATA_NETLIST_FORMAT = ("{file_type} NET={network} {deembed} {include_abs} "
                                 "{file_name} {include_comments} {precision} "
                                 "{parameter_type} {parameter_form} {ports}")
+N_COUPLED_LINE_FORMAT = "NCLINE {deembed} {include_abs} {file_name} {precision} {file_type}"
+N_COUPLED_LINE_TYPES = {"spectre": "SPECTRE", "spice": "PSPICE"}
+
 # parameter block for netlist project
 PARAMETER_NETLIST = """\
 VAR

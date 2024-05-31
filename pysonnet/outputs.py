@@ -1,14 +1,280 @@
 import csv
 import copy
+import pathlib
 import numpy as np
 from matplotlib import colors
 from matplotlib import pyplot as plt
 from scipy.interpolate import interp2d
+from scipy.constants import epsilon_0, mu_0
 
 
-class Sweep:
-    """Class for handling sweep data output from Sonnet"""
-    pass
+class NCoupledLines:
+    """
+    Class for loading in outputs saved with project.add_n_coupled_lines_file().
+    Different formats can be loaded with the "from_" methods.
+    """
+    def __init__(self, frequencies, inductance, resistance, capacitance, conductance):
+        self.frequencies = np.array(frequencies)[:, np.newaxis, np.newaxis]
+        self.inductance = np.array(inductance, ndmin=3)
+        self.resistance = np.array(resistance, ndmin=3)
+        self.capacitance = np.array(capacitance, ndmin=3)
+        self.conductance = np.array(conductance, ndmin=3)
+        self.impedance = self.resistance + 1j * 2 * np.pi * self.frequencies * self.inductance
+        self.admittance = self.conductance + 1j * 2 * np.pi * self.frequencies * self.capacitance
+
+        # Find the propagation eigenvalues and basis
+        propagation_constant_sq, transform = self._eig_sorted(self.admittance @ self.impedance)
+
+        self.propagation_basis = transform
+        transform_inv = np.linalg.inv(transform)
+
+        self.propagation_constant = np.sqrt(propagation_constant_sq)
+
+        # Determine characteristic impedance matrix and eigenvalues
+        shape = self.propagation_constant.shape
+        propagation_constant_inv = np.zeros(shape + shape[-1:], dtype=self.propagation_constant.dtype)
+        diagonals = propagation_constant_inv.diagonal(axis1=-2, axis2=-1)
+        diagonals.setflags(write=True)
+        diagonals[:] = 1 / self.propagation_constant  # updates propagation_constant_inv
+        self.characteristic_impedance_matrix = self.impedance @ transform @ propagation_constant_inv @ transform_inv
+
+        self.characteristic_impedance, self.impedance_basis = self._eig_sorted(self.characteristic_impedance_matrix)
+
+        self.effective_relative_permittivity = (
+            self.propagation_constant / (2j * np.pi * self.frequencies[:, :, 0] * np.sqrt(epsilon_0 * mu_0))
+        )**2
+
+    @classmethod
+    def from_spectre(cls, file_name):
+        frequencies = []
+        inductances = []
+        resistances = []
+        capacitances = []
+        conductances = []
+        dim = None
+        with open(file_name) as fid:
+            while True:
+                line = fid.readline()
+
+                # Exit the while loop if we run out of lines.
+                if not line:
+                    break
+                    # raise IOError(f"Improper file format for '{file_name}")
+
+                # Remove the comments, leading or trailing whitespace, and make
+                # everything lowercase.
+                line = line.split(';', 1)[0].strip().lower()
+
+                # Skip the line if it was only comments.
+                if len(line) == 0:
+                    continue
+
+                if line.startswith('format'):
+                    number = line.count(":") - 1  # extra colon for after format
+                    dim = int((np.sqrt(8 * number + 1) - 1) / 2)  # (dim + 1) * dim / 2 elements in upper triangle
+                    for _ in range(3):  # discard next three lines
+                        fid.readline()
+                    continue
+                # If we are here we should be reading the data and have parsed the header info
+                if dim is None:
+                    raise IOError(f"File '{file_name} doesn't have the required format line")
+                f, inductance_line = line.split(":")
+                frequencies.append(float(f))
+                inductances.append(cls._spectre_str_to_matrix(inductance_line, dim))
+                resistances.append(cls._spectre_str_to_matrix(fid.readline(), dim))
+                capacitances.append(cls._spectre_str_to_matrix(fid.readline(), dim))
+                conductances.append(cls._spectre_str_to_matrix(fid.readline(), dim))
+        return cls(frequencies, inductances, resistances, capacitances, conductances)
+
+    @classmethod
+    def from_hspice(cls, file_name):
+        raise NotImplementedError
+
+    @classmethod
+    def _spectre_str_to_matrix(cls, string, dimension):
+        array = np.array(string.split(), dtype=float)
+        matrix = np.empty((dimension, dimension), dtype=float)
+        upper = np.triu_indices(dimension, k=0)
+        matrix[upper] = array
+        lower = np.tril_indices(dimension, k=-1)
+        matrix[lower] = matrix.T[lower]
+        return matrix
+
+    @classmethod
+    def _eig_sorted(cls, matrix):
+        eigenvalues, eigenvectors = np.linalg.eig(matrix)
+        sorted_indices = np.argsort(eigenvalues, axis=-1)  # sort by eigenvalue real part
+        eigenvalues = np.take_along_axis(eigenvalues, sorted_indices, axis=-1)
+        eigenvectors = np.take_along_axis(eigenvectors, sorted_indices[:, np.newaxis, :], axis=-1)
+        return eigenvalues, eigenvectors
+
+
+class SYZParameter:
+    """
+    Class for loading in outputs saved with project.add_syz_parameter_file().
+    Different formats can be loaded with the "from_" methods.
+    """
+    def __init__(self, f, value, value_type="s"):
+        self.f = f
+        self.value = value
+        self.value_type = value_type
+
+    @classmethod
+    def from_touchstone(cls, file_name):
+        # Get the number of ports from the extension (version 1)
+        version = 1.
+        extension = pathlib.Path(file_name).suffix
+        if (extension[1] == 's') and (extension[-1] == 'p'):  # sNp
+            try:
+                n_ports = int(extension[2:-1])
+            except ValueError:
+                message = ("The file name does not have a s-parameter extension. "
+                           f"It is [{extension}] instead. Please, correct the "
+                           "extension to the form: 'sNp', where N is the number of ports.")
+                raise IOError(message)
+        elif extension == '.ts':
+            n_ports = None
+        else:
+            message = ('The filename does not have the expected Touchstone '
+                       'extension (.sNp or .ts)')
+            raise IOError(message)
+
+        values = []
+        flip_port_order = False
+        matrix_format = 'full'
+        with open(file_name) as fid:
+            while True:
+                line = fid.readline()
+
+                # Exit the while loop if we run out of lines.
+                if not line:
+                    break
+
+                # Remove the comments, leading or trailing whitespace, and make
+                # everything lowercase.
+                line = line.split('!', 1)[0].strip().lower()
+
+                # Skip the line if it was only comments.
+                if len(line) == 0:
+                    continue
+
+                if line.startswith('[version]'):
+                    version = float(line.partition('[version]')[2])
+                    continue
+
+                if line.startswith('[number of ports]'):
+                    n_ports = int(line.partition('[number of ports]')[2])
+                    continue
+
+                if line.startswith('[two-port data order]'):
+                    order = line.partition('[two-port data order]')[2].strip()
+                    if order == '21_12':
+                        flip_port_order = True
+                    continue
+
+                # Skip the number of frequencies line.
+                if line.startswith('[number of frequencies]'):
+                    continue
+
+                if line.startswith('[matrix format]'):
+                    matrix_format = line.partition('[matrix format]')[2].strip()
+                    continue
+
+                if line.startswith('[mixed-mode order]'):
+                    message = "The mixed-mode order data format is not supported."
+                    raise IOError(message)
+
+                # Skip the network data line.
+                if line.startswith('[network data]'):
+                    continue
+
+                # Skip the end line.
+                if line.startswith('[end]'):
+                    continue
+
+                # Note the options.
+                if line[0] == '#':
+                    options = line[1:].strip().split()
+                    # fill the option line with the missing defaults
+                    options.extend(['ghz', 's', 'ma', 'r', '50'][len(options):])
+                    unit = options[0]
+                    parameter_type = options[1]
+                    data_format = options[2]
+                    continue
+
+                # Collect all the values.
+                values.extend([float(v) for v in line.split()])
+
+        # Version 1 files have weird port order for 2 port matrices
+        if version < 2 and n_ports == 2:
+            flip_port_order = True
+
+        # Reshape into rows of f, s11, s12, s13, s21, s22, s23, ...
+        if matrix_format == 'full':
+            values = np.asarray(values).reshape((-1, 2 * n_ports ** 2 + 1))
+        else:  # lower or upper
+            values = np.asarray(values).reshape((-1, n_ports ** 2 + n_ports + 1))
+
+        # Remove noise values
+        noise = np.where(np.diff(values[:, 0]) < 0)[0]  # f should increase
+        if len(noise) != 0:
+            values = values[noise[0] + 1:, :]
+
+        # Extract the frequency in GHz.
+        multiplier = {'hz': 1.0, 'khz': 1e3, 'mhz': 1e6, 'ghz': 1e9}[unit]
+        f = values[:, 0] * multiplier / 1e9  # always in GHz
+
+        # Convert to a complex number.
+        if data_format == "ri":
+            z = values[:, 1::2] + 1j * values[:, 2::2]
+        else:
+            mag = values[:, 1::2]
+            angle = np.pi / 180 * values[:, 2::2]
+            if data_format == "ma":
+                z = mag * np.exp(1j * angle)
+            else:  # == "db"
+                z = 10 ** (mag / 20.0) * np.exp(1j * angle)
+
+        # Get the parameter matrix (f.size x n_ports x n_ports)
+        if matrix_format == 'full':
+            parameter = z.reshape(-1, n_ports, n_ports)
+        else:
+            parameter = np.empty((f.size, n_ports, n_ports))
+            upper_indices = np.triu_indices(n_ports)
+            lower_indices = np.tril_indices(n_ports)
+            if matrix_format == 'upper':
+                parameter[:, upper_indices[0], upper_indices[1]] = z
+                parameter_t = parameter.transpose((0, 2, 1))
+                parameter[:, lower_indices[0], lower_indices[1]] = parameter_t[:, lower_indices[0], lower_indices[1]]
+            else:  # lower
+                parameter[:, lower_indices[0], lower_indices[1]] = z
+                parameter_t = parameter.transpose((0, 2, 1))
+                parameter[:, upper_indices[0], upper_indices[1]] = parameter_t[:, upper_indices[0], upper_indices[1]]
+
+        if flip_port_order:
+            parameter = parameter.transpose((0, 2, 1))
+
+        return cls(f, parameter, parameter_type)
+
+    @classmethod
+    def from_databank(cls, file_name):
+        raise NotImplementedError
+
+    @classmethod
+    def from_cadence(cls, file_name):
+        raise NotImplementedError
+
+    @classmethod
+    def from_spreadsheet(cls, file_name):
+        raise NotImplementedError
+
+    @classmethod
+    def from_mdif_s2p(cls, file_name):
+        raise NotImplementedError
+
+    @classmethod
+    def from_mdif_ebridge(cls, file_name):
+        raise NotImplementedError
 
 
 class CurrentDensity:
